@@ -33,4 +33,12 @@ export const api = {
   cancelJob: (id) => j(`/api/job/cancel?id=${encodeURIComponent(id)}`, { method: 'POST' }),
   fileUrl: (jobId, inline = false) =>
     `/api/file?job=${encodeURIComponent(jobId)}${inline ? '&inline=1' : ''}`,
+  // —— 登录 Cookie（可选，用于解锁列表/搜索通道；服务端仅内存保存）——
+  session: () => j('/api/session'),
+  setSession: (cookie) => j('/api/session', { method: 'POST', body: JSON.stringify({ cookie }) }),
+  clearSession: () => j('/api/session', { method: 'DELETE' }),
+  // —— 目录爬取 ——
+  crawlStart: (opts = {}) => j('/api/crawl/start', { method: 'POST', body: JSON.stringify(opts) }),
+  crawlStop: () => j('/api/crawl/stop', { method: 'POST' }),
+  crawlStatus: () => j('/api/crawl/status'),
 }

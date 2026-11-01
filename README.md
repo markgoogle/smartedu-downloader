@@ -265,3 +265,13 @@ EOF
 
 **Q：可以局域网/公网直接访问吗？**
 改 `SMARTEDU_HOST=0.0.0.0` 可行，但请务必置于 HTTPS 反向代理与访问控制之后，并保持 `SMARTEDU_ALLOW_PRIVATE_HOSTS=0`。
+
+## 登录 Cookie（可选，解锁列表通道）
+
+平台页面 `https://basic.smartedu.cn/tchMaterial?defaultTag=…` 公开可见，但其背后的聚合检索接口
+`x-search.ykt.cbern.com.cn/v1/resources/aggregate` 需要登录态。本站支持输入 Cookie 走该通道枚举全站教材：
+
+- **设置**：前端「抓取目录」页粘贴浏览器完整 Cookie（F12 → Network → 任意请求 → Request Headers → Cookie），或环境变量 `SMARTEDU_COOKIE="k1=v1; k2=v2"`；API：`POST /api/session {"cookie": "…"}`。
+- **抓取流程**：阶段0 带 Cookie 分页调列表接口（401/403→`unauthorized`，网关拦截→`unreachable`，均自动降级）→ 阶段1 种子扩散 → 阶段2 UUID 采样。状态见 `GET /api/crawl/status`（含 `searchStatus`）。
+- **安全**：Cookie 仅存进程内存，绝不写盘/日志/API 回显（只回显脱敏摘要 names/count）；只附带在白名单平台域请求上；重启即失效。清除：`DELETE /api/session` 或界面按钮。
+

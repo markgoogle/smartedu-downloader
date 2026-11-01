@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks'
+import { useEffect, useRef, useState } from 'preact/hooks'
 import { render } from 'preact'
 import { api } from './api.js'
 import { startDownload } from './jobs.js'
@@ -229,6 +229,121 @@ function Help() {
   )
 }
 
+// ---------------- 目录抓取（Cookie 登录态可选） ----------------
+const PHASE_TEXT = { idle: '空闲', search: '列表接口枚举中', seeds: '种子扩散中',
+                     random: '随机采样发现中', done: '完成', stopped: '已手动停止',
+                     error: '出错' }
+const SEARCH_TEXT = { '': '', skipped: '未配置 Cookie，跳过列表通道',
+                      ok: '列表接口可用 ✓', unauthorized: 'Cookie 无效/过期（403/401）',
+                      unreachable: '列表接口不可达（网关拦截）',
+                      badresponse: '列表响应格式未知' }
+
+function CrawlPanel({ onDone }) {
+  const [sess, setSess] = useState(null)
+  const [cookie, setCookie] = useState('')
+  const [status, setStatus] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    api.session().then(setSess).catch(() => {})
+    return () => { clearInterval(pollRef.current); pollRef.current = null }
+  }, [])
+
+  const pollRef = useRef(null)
+  const watch = () => {
+    clearInterval(pollRef.current)
+    pollRef.current = setInterval(async () => {
+      try {
+        const s = await api.crawlStatus()
+        setStatus(s)
+        if (!s.running) {
+          clearInterval(pollRef.current); pollRef.current = null
+          api.session().then(setSess).catch(() => {})
+          if (s.phase === 'done' || s.phase === 'stopped') {
+            await api.reloadCatalog().catch(() => {})
+            onDone && onDone()
+            toast(`抓取结束：新增 ${s.hits} 本`, 'ok')
+          }
+        }
+      } catch { /* 忽略瞬时错误 */ }
+    }, 2000)
+  }
+
+  const saveCookie = async () => {
+    setBusy(true); setErr('')
+    try {
+      setSess(await api.setSession(cookie.trim()))
+      setCookie('')
+      toast('Cookie 已保存到内存（不落盘、不回显）', 'ok')
+    } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  const clearCookie = async () => {
+    setBusy(true)
+    try { setSess(await api.clearSession()); toast('已清除 Cookie') }
+    catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  const start = async () => {
+    setBusy(true); setErr('')
+    try { await api.crawlStart({}); watch(); setStatus(await api.crawlStatus()) }
+    catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  const stop = async () => {
+    setBusy(true)
+    try { await api.crawlStop() } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+
+  const running = status?.running
+  return (
+    <section class="panel active">
+      <div class="card narrow">
+        <h3>自动抓取全站教材目录</h3>
+        <p class="muted">
+          通道①「列表接口」：<code>x-search.ykt.cbern.com.cn</code> 聚合检索——页面公开，但该接口需登录态；
+          在下方粘贴浏览器 <b>完整 Cookie</b>（F12 → Network → 任意 smartedu 请求 → Request Headers → Cookie）即可解锁，
+          可分页枚举全站教材。Cookie 仅存服务端内存，绝不落盘/写日志/回显。<br />
+          通道②「匿名保底」：无 Cookie 或接口被网关拦截时，自动走 种子扩散 + UUID 采样（公开详情 JSON）。
+        </p>
+
+        {sess?.configured
+          ? <div class="chips"><span class="chip">已配置 Cookie：{sess.count} 项（{sess.names.slice(0, 4).join(', ')}…）</span></div>
+          : <div class="warn small">未配置 Cookie —— 将只走匿名保底通道。</div>}
+        <div class="row">
+          <input style={{ flex: 1 }} type="text" spellcheck={false}
+            placeholder="粘贴平台登录后的完整 Cookie 串（k1=v1; k2=v2; …）"
+            value={cookie} onInput={e => setCookie(e.target.value)} />
+          <button class="btn mini" disabled={busy || !cookie.trim()} onClick={saveCookie}>保存</button>
+          {sess?.configured && <button class="btn mini ghost" disabled={busy} onClick={clearCookie}>清除</button>}
+        </div>
+        {err && <div class="st-err small">{err}</div>}
+
+        <div class="row">
+          {!running
+            ? <button class="btn" disabled={busy} onClick={start}>▶ 开始抓取</button>
+            : <button class="btn ghost" onClick={stop}>■ 停止</button>}
+          {status && <span class="muted">
+            {PHASE_TEXT[status.phase] || status.phase}
+            {' · '}请求 {status.requests} / 新增 {status.hits} / 已有 {status.known}
+            {status.elapsed ? ` · ${Math.round(status.elapsed)}s` : ''}
+          </span>}
+        </div>
+        {status && (
+          <table class="kv">
+            <tr><td>列表通道状态</td><td>{SEARCH_TEXT[status.searchStatus] || status.searchStatus || '—'}</td></tr>
+            <tr><td>最近命中</td><td>{status.lastHitTitle || '—'}</td></tr>
+            {status.error && <tr><td>错误</td><td class="st-err">{status.error}</td></tr>}
+          </table>
+        )}
+        {running && <ProgressBar job={{ status: 'running', downloaded: status?.hits || 0, total: 0 }} />}
+      </div>
+    </section>
+  )
+}
+
 // ---------------- App ----------------
 function App() {
   const [tab, setTab] = useState('browse')
@@ -246,6 +361,7 @@ function App() {
         </div>
         <nav class="tabs">
           <button class={tab === 'browse' ? 'active' : ''} onClick={() => setTab('browse')}>教材列表</button>
+          <button class={tab === 'crawl' ? 'active' : ''} onClick={() => setTab('crawl')}>抓取目录</button>
           <button class={tab === 'direct' ? 'active' : ''} onClick={() => setTab('direct')}>按 ID 直达</button>
           <button class={tab === 'jobs' ? 'active' : ''} onClick={() => setTab('jobs')}>
             下载任务 <JobBadge /></button>
@@ -254,6 +370,7 @@ function App() {
       </header>
       <main>
         {tab === 'browse' && <Browse onOpenDetail={setDetailCid} />}
+        {tab === 'crawl' && <CrawlPanel onDone={() => setTab('browse')} />}
         {tab === 'direct' && <Direct onOpenDetail={setDetailCid} />}
         {tab === 'jobs' && <JobsPanel />}
         {tab === 'help' && <Help />}
