@@ -17,8 +17,10 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from .auth import SessionStore
 from .catalog import Catalog, DIM_KEYS
 from .config import UUID_RE, settings
+from .crawler import Crawler
 from .downloader import UpstreamError, get_meta, Client
 from .jobs import JobStore, relpath
 from .security import RateLimiter, is_safe_relpath, sanitize_filename
@@ -39,6 +41,8 @@ async def lifespan(app: FastAPI):
     app.state.store = JobStore()
     await app.state.store.init_client()
     app.state.limiter = RateLimiter(settings.rate_limit_per_minute)
+    app.state.sessions = SessionStore()
+    app.state.crawler = Crawler(settings.data_dir, app.state.sessions)
     sweeper = asyncio.create_task(_sweep_loop(app.state.store))
     yield
     sweeper.cancel()
@@ -135,6 +139,75 @@ async def api_catalog_reload(request: Request):
     cat: Catalog = request.app.state.catalog
     n = cat.reload()
     return {"entries": n}
+
+
+# ---------------------------------------------------------------------------
+# 登录 Cookie（可选，仅内存态；响应只回显脱敏摘要）
+# ---------------------------------------------------------------------------
+
+class CookieReq(BaseModel):
+    cookie: str = Field(..., min_length=1, max_length=8192)
+
+
+def _sessions(request: Request) -> SessionStore:
+    return request.app.state.sessions
+
+
+@app.get("/api/session")
+async def api_session_get(request: Request):
+    """查询 Cookie 配置状态（绝不回显 value）。"""
+    return _sessions(request).session.masked()
+
+
+@app.post("/api/session")
+async def api_session_set(req: CookieReq, request: Request):
+    s = _sessions(request)
+    mask = s.set(req.cookie, source="manual")
+    if not mask["configured"]:
+        raise HTTPException(400, "Cookie 解析为空：请粘贴浏览器请求头里的完整 Cookie 串")
+    log.info("session cookie configured: %d names", mask["count"])
+    return mask
+
+
+@app.delete("/api/session")
+async def api_session_clear(request: Request):
+    return _sessions(request).clear()
+
+
+# ---------------------------------------------------------------------------
+# 目录爬取（阶段0 需 Cookie 解锁列表接口；无 Cookie 时自动走种子+采样）
+# ---------------------------------------------------------------------------
+
+class CrawlReq(BaseModel):
+    maxRequests: int = Field(20000, ge=100, le=200000)
+    secondsBudget: int = Field(600, ge=30, le=7200)
+    minHitRate: float = Field(0.002, ge=0.0, le=0.5)
+    concurrency: int = Field(8, ge=1, le=16)
+
+
+@app.post("/api/crawl/start")
+async def api_crawl_start(request: Request, req: CrawlReq | None = None):
+    crawler: Crawler = request.app.state.crawler
+    req = req or CrawlReq()
+    ok = await crawler.start(req.maxRequests, req.secondsBudget,
+                             req.minHitRate, req.concurrency)
+    if not ok:
+        raise HTTPException(409, "已有抓取任务在运行")
+    return {"started": True, "cookieConfigured": _sessions(request).has()}
+
+
+@app.post("/api/crawl/stop")
+async def api_crawl_stop(request: Request):
+    request.app.state.crawler.stop()
+    return {"stopping": True}
+
+
+@app.get("/api/crawl/status")
+async def api_crawl_status(request: Request):
+    crawler: Crawler = request.app.state.crawler
+    out = crawler.stats.public()
+    out["cookie"] = _sessions(request).session.masked()
+    return out
 
 
 @app.get("/api/detail")

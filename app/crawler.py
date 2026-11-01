@@ -30,7 +30,9 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from .config import DETAIL_PATH_TMPL, S_FILE_HOSTS, UA, settings
+from .auth import SessionStore
+from .config import (DETAIL_PATH_TMPL, SEARCH_API_TEMPLATES, S_FILE_HOSTS, UA,
+                     settings)
 from .filters import DIM_KEYS, dim_for, sort_facet
 
 log = logging.getLogger("smartedu.crawler")
@@ -49,7 +51,7 @@ BUILTIN_SEEDS = [
 @dataclass
 class CrawlStats:
     running: bool = False
-    phase: str = "idle"           # idle|seeds|random|done|stopped|error
+    phase: str = "idle"           # idle|search|seeds|random|done|stopped|error
     requests: int = 0
     hits: int = 0                 # 本次运行新增命中
     known: int = 0                # 快照已有条目数
@@ -58,6 +60,7 @@ class CrawlStats:
     finished_at: float = 0.0
     error: str = ""
     last_hit_title: str = ""
+    search_status: str = ""       # skipped|ok|unauthorized|unreachable|badresponse
 
     def public(self) -> dict:
         return {"running": self.running, "phase": self.phase,
@@ -66,7 +69,8 @@ class CrawlStats:
                 "startedAt": self.started_at, "finishedAt": self.finished_at,
                 "elapsed": (self.finished_at or time.time()) - self.started_at
                            if self.started_at else 0.0,
-                "error": self.error, "lastHitTitle": self.last_hit_title}
+                "error": self.error, "lastHitTitle": self.last_hit_title,
+                "searchStatus": self.search_status}
 
 
 def slim(detail: dict) -> dict:
@@ -105,11 +109,33 @@ def extract_sibling_cids(detail: dict) -> list[str]:
     return out
 
 
+def slim_item(item: dict) -> dict | None:
+    """把搜索/聚合接口返回的条目归一为快照条目（字段名兼容多种拼写）。"""
+    cid = str(item.get("id") or item.get("contentId") or "").lower()
+    if not UUID_RE.match(cid):
+        return None
+    gt = item.get("global_title") or item.get("globalTitle") or {}
+    title = gt.get("zh-CN") if isinstance(gt, dict) else str(gt)
+    tags = []
+    for t in item.get("tag_list") or item.get("tagList") or []:
+        if isinstance(t, dict):
+            tags.append({"tag_dimension_id": t.get("tag_dimension_id")
+                         or t.get("tagDimensionId"),
+                         "tag_name": t.get("tag_name") or t.get("tagName")})
+    return {"id": cid,
+            "global_title": {"zh-CN": title or ""},
+            "global_label": item.get("global_label") or item.get("globalLabel"),
+            "tag_list": tags,
+            "update_time": item.get("update_time") or item.get("updateTime"),
+            "sort": int(time.time() * 1000)}
+
+
 class Crawler:
     """单实例后台爬虫；同一时刻只允许一个任务（生产安全：防并发写快照）。"""
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, sessions: SessionStore | None = None):
         self.data_dir = data_dir
+        self.sessions = sessions or SessionStore()
         self.stats = CrawlStats()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -185,11 +211,71 @@ class Crawler:
                 continue
         return None
 
+    async def _search_pages(self, client: httpx.AsyncClient,
+                            items: dict[str, dict]) -> int:
+        """登录态列表通道：带 Cookie 调聚合检索接口，按 tag 组合分页枚举全站教材。
+
+        未配置 Cookie / 接口不可达时安全降级（记 search_status，不抛错），
+        继续走种子+随机采样通道。Cookie 仅附带在白名单平台域请求上。
+        """
+        st = self.stats
+        if not self.sessions.has():
+            st.search_status = "skipped"
+            return 0
+        from .security import validate_remote_url
+        added = 0
+        any_ok = False
+        for name, tmpl in SEARCH_API_TEMPLATES:
+            offset, size = 0, 100
+            try:
+                while not self._stop.is_set() \
+                        and st.requests < max(1000, st.requests + 1) + 2000:
+                    url = tmpl.format(offset=offset, size=size, tags="")
+                    validate_remote_url(url, allow_private=settings.allow_private_hosts)
+                    st.requests += 1
+                    resp = await client.get(url, cookies=self.sessions.session.cookies,
+                                            timeout=min(20.0, settings.http_timeout))
+                    if resp.status_code in (401, 403):
+                        st.search_status = "unauthorized"
+                        break
+                    if resp.status_code != 200:
+                        st.search_status = "unreachable"
+                        break
+                    data = resp.json()
+                    arr = (data.get("data") or data.get("results")
+                           or data.get("items") or [])
+                    if isinstance(data, dict) and not arr and "content" in data:
+                        arr = data["content"]
+                    if not isinstance(arr, list) or not arr:
+                        if not any_ok:
+                            st.search_status = "badresponse"
+                        break
+                    st.search_status = "ok"
+                    any_ok = True
+                    for raw in arr:
+                        if not isinstance(raw, dict):
+                            continue
+                        it = slim_item(raw)
+                        if it and it["id"] not in items:
+                            items[it["id"]] = it
+                            added += 1
+                            st.hits += 1
+                    log.info("search[%s] offset=%d +%d (total %d)",
+                             name, offset, len(arr), len(items))
+                    if len(arr) < size:
+                        break
+                    offset += size
+            except (httpx.HTTPError, ValueError) as e:
+                st.search_status = st.search_status or "unreachable"
+                log.warning("search channel failed: %s", type(e).__name__)
+        return added
+
     async def _run(self, max_requests: int, seconds_budget: int,
                    min_hit_rate: float, concurrency: int) -> None:
         st = self.stats
         st.running, st.error, st.requests, st.hits, st.misses = True, "", 0, 0, 0
-        st.started_at, st.finished_at, st.phase = time.time(), 0.0, "seeds"
+        st.started_at, st.finished_at, st.phase = time.time(), 0.0, "search"
+        st.search_status = ""
         deadline = st.started_at + seconds_budget
         try:
             items = self._load_existing()
@@ -200,12 +286,22 @@ class Crawler:
                     follow_redirects=False, limits=httpx.Limits(
                         max_connections=concurrency * 2)) as client:
 
+                # —— 阶段0（可选）：登录态列表/搜索通道 ——
+                if self.sessions.has():
+                    try:
+                        await self._search_pages(client, items)
+                    except Exception as e:      # 搜索失败不影响后续阶段
+                        st.search_status = f"error:{type(e).__name__}"
+                        log.warning("search phase failed: %s", e)
+
+                # —— 阶段1：种子 + 已知条目刷新 + 兄弟扩散 ——
+                st.phase = "seeds"
+
                 async def one(cid: str) -> tuple[str, dict | None, list[str]]:
                     async with sem:
                         d = await self._fetch_detail(client, cid)
                         return cid, d, (extract_sibling_cids(d) if d else [])
 
-                # —— 阶段1：种子 + 已知条目刷新 + 兄弟扩散 ——
                 frontier = list(dict.fromkeys(self._seed_ids() + list(items.keys())))
                 visited = set(frontier)
                 while frontier and not self._stop.is_set() \
