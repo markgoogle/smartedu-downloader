@@ -44,7 +44,7 @@ class Settings:
 settings = Settings()
 
 # —— 平台端点（2026-11-01 实测验证）——
-S_FILE_HOSTS = ["s-file-1", "s-file-2", "s-file-3"]
+S_FILE_HOSTS = ["https://s-file-1", "https://s-file-2", "https://s-file-3"]
 DETAIL_PATH_TMPL = "/zxx/ndrv2/resources/tch_material/details/{cid}.json"
 ALLOWED_REMOTE_SUFFIXES = (".ykt.cbern.com.cn",)  # SSRF 白名单：仅平台 CDN 域
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "

@@ -163,7 +163,9 @@ def encode_url(url: str) -> str:
 
 def rotate_host(url: str, idx: int) -> str:
     if re.match(r"https://s-file-\d+", url):
-        return re.sub(r"https://s-file-\d+", S_FILE_HOSTS[idx % 3], url, count=1)
+        # 注意：re.sub 会把替换串中的 \d 当作组引用，必须用 lambda 原样替换
+        return re.sub(r"https://s-file-\d+",
+                      lambda m: S_FILE_HOSTS[idx % 3], url, count=1)
     m = re.match(r"https://r(\d)-ndr(-private)?\.", url)
     if m:
         kind = "-ndr-private." if m.group(2) else "-ndr."
@@ -221,7 +223,7 @@ async def fetch_detail_json(cid: str, client: Client) -> dict:
     base_path = DETAIL_PATH_TMPL.format(cid=cid)
     err_status = None
     for i, host in enumerate(S_FILE_HOSTS):
-        url = f"https://{host}.ykt.cbern.com.cn{base_path}"
+        url = f"{host}.ykt.cbern.com.cn{base_path}"
         validate_remote_url(url, allow_private=settings.allow_private_hosts)
         resp = await client.get(url, timeout=min(20.0, settings.http_timeout))
         if resp.status_code == 200:
