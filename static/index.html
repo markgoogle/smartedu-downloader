@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>智慧教育平台 · 教材浏览器与一键下载</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">📚</span>
+    <div><b>国家中小学智慧教育平台 · 教材下载台</b>
+      <small>免登录 · 原生PDF优先，自动回退图片合成（实测流程复现）</small></div>
+  </div>
+  <nav class="tabs">
+    <button data-tab="browse" class="tab active">教材列表</button>
+    <button data-tab="direct" class="tab">按 ID 直达</button>
+    <button data-tab="jobs" class="tab">下载任务 <i id="jobBadge" class="badge">0</i></button>
+    <button data-tab="help" class="tab">说明</button>
+  </nav>
+</header>
+
+<main>
+<!-- ================= 列表 ================= -->
+<section id="tab-browse" class="panel active">
+  <div class="toolbar">
+    <input id="q" type="search" placeholder="搜索书名 / 学科 / 册别，如：物理 必修 第三册">
+    <select id="fStage"><option value="">学段(全部)</option></select>
+    <select id="fSubject"><option value="">学科(全部)</option></select>
+    <select id="fVersion"><option value="">版本(全部)</option></select>
+    <button id="btnSearch" class="btn">检索</button>
+    <span id="catInfo" class="muted"></span>
+  </div>
+  <div id="srcWarn" class="warn hidden"></div>
+  <div id="list" class="grid"></div>
+  <div class="pager">
+    <button id="prev" class="btn ghost">上一页</button>
+    <span id="pageInfo"></span>
+    <button id="next" class="btn ghost">下一页</button>
+  </div>
+</section>
+
+<!-- ================= 直达 ================= -->
+<section id="tab-direct" class="panel">
+  <div class="card narrow">
+    <h3>用 contentId 直达</h3>
+    <p class="muted">粘贴平台教材的 contentId（UUID），直接读取公开详情 JSON。</p>
+    <div class="row"><input id="cidInput" placeholder="例如 b2774427-227a-496b-805e-59b510c87ebe">
+      <button id="btnCid" class="btn">查询</button></div>
+    <pre id="cidOut" class="json"></pre>
+  </div>
+</section>
+
+<!-- ================= 任务 ================= -->
+<section id="tab-jobs" class="panel">
+  <div id="jobs" class="list"></div>
+</section>
+
+<!-- ================= 说明 ================= -->
+<section id="tab-help" class="panel">
+  <div class="card">
+    <h3>工作流程（与 REPORT.md 实测一致）</h3>
+    <ol class="flow">
+      <li><b>详情 JSON</b>：<code>s-file-{1,2,3}.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/{contentId}.json</code> —— 公开、免登录、免 Token、免 Referer。</li>
+      <li><b>路径 A（原生 PDF）</b>：<code>ti_items[source].ti_storages</code> 的私有域直链去掉 <code>-private</code> → 公开桶。命中即得带文字层的出版社原生 PDF；约 1/3 命中，其余 403 AccessDenied。</li>
+      <li><b>路径 B（图片合成）</b>：preview URL 替换页码 <code>/{page}.jpg</code>，页数取 <code>requirements.pagesize</code>（≠ preview 条目数），并发下载后原样嵌入 PDF（无文字层，100% 可用）。</li>
+      <li><b>校验</b>：字节数 == <code>ti_size</code>、魔数 <code>%PDF-</code>、尾部 <code>%%EOF</code>、页数 == pagesize、pagesize+1 页应 403。</li>
+    </ol>
+    <h3>注意</h3>
+    <ul>
+      <li>全站请求<b>不发送 Referer</b>（实测带非白名单 Referer 会 403）。</li>
+      <li>列表数据来自本地快照 <code>catalog_data/*.json</code>；平台目录端点需浏览器会话，可用 <code>refresh_catalog.py</code> 刷新。</li>
+      <li>产物保存在 <code>downloads/&lt;contentId&gt;/</code>。</li>
+    </ul>
+  </div>
+</section>
+</main>
+
+<div id="modal" class="modal hidden">
+  <div class="sheet">
+    <button class="close" onclick="closeModal()">✕</button>
+    <div id="modalBody"></div>
+  </div>
+</div>
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
